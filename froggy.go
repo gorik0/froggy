@@ -83,6 +83,17 @@ func (p *WorkerPool) FailedTasks() uint64 {
 	return atomic.LoadUint64(&p.failedTaskCount)
 }
 
+// CompletedTasks returns the total number of tasks that have completed their exection either successfully
+// or with panic since the pool was created
+func (p *WorkerPool) CompletedTasks() uint64 {
+	return p.SuccessfulTasks() + p.FailedTasks()
+}
+
+// Stopped returns true if the pool has been stopped and is no longer accepting tasks, and false otherwise.
+func (p *WorkerPool) Stopped() bool {
+	return atomic.LoadInt32(&p.stopped) == 1
+}
+
 func Context(prtCtx context.Context) Option {
 	return func(pool *WorkerPool) {
 		pool.context, pool.contextCancel = context.WithCancel(prtCtx)
@@ -160,6 +171,11 @@ func NewPool(maxWorkers int, maxCapacity int, options ...Option) *WorkerPool {
 	pool.workersWaitGroup.Add(1)
 	go pool.purge()
 
+	if pool.minWorkers > 0 {
+		for i := 0; i < pool.minWorkers; i++ {
+			pool.maybeStartWorker(nil)
+		}
+	}
 	return
 }
 
@@ -208,6 +224,87 @@ func (p *WorkerPool) decrementWorkerCount() bool {
 
 	// Decrement idle count
 	atomic.AddInt32(&p.idleWorkerCount, -1)
+
+	return true
+}
+func (p *WorkerPool) maybeStartWorker(firstTask func()) bool {
+
+	if incremented := p.incrementWorkerCount(); !incremented {
+		return false
+	}
+
+	if firstTask == nil {
+		// Worker starts idle
+		atomic.AddInt32(&p.idleWorkerCount, 1)
+	}
+
+	// Launch worker goroutine
+	go worker(p.context, &p.workersWaitGroup, firstTask, p.tasks, p.executeTask, &p.tasksWaitGroup)
+
+	return true
+}
+
+func (p *WorkerPool) executeTask(task func(), isFirstTask bool) {
+
+	defer func() {
+		if panic := recover(); panic != nil {
+			// Increment failed task count
+			atomic.AddUint64(&p.failedTaskCount, 1)
+
+			// Invoke panic handler
+			p.panicHandler(panic)
+
+			// Increment idle count
+			atomic.AddInt32(&p.idleWorkerCount, 1)
+		}
+		p.tasksWaitGroup.Done()
+	}()
+
+	// Decrement idle count
+	if !isFirstTask {
+		atomic.AddInt32(&p.idleWorkerCount, -1)
+	}
+
+	// Decrement waiting task count
+	atomic.AddUint64(&p.waitingTaskCount, ^uint64(0))
+
+	// Execute task
+	task()
+
+	// Increment successful task count
+	atomic.AddUint64(&p.successfulTaskCount, 1)
+
+	// Increment idle count
+	atomic.AddInt32(&p.idleWorkerCount, 1)
+}
+
+func (p *WorkerPool) incrementWorkerCount() bool {
+
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	runningWorkerCount := p.RunningWorkers()
+
+	// Reached max workers, do not create a new one
+	if runningWorkerCount >= p.maxWorkers {
+		return false
+	}
+
+	// Idle workers available, do not create a new one
+	if runningWorkerCount >= p.minWorkers && runningWorkerCount > 0 && p.IdleWorkers() > 0 {
+		return false
+	}
+
+	// Execute the resizing strategy to determine if we should create more workers
+	if resize := p.strategy.Resize(runningWorkerCount, p.minWorkers, p.maxWorkers); !resize {
+		return false
+	}
+
+	// Increment worker count
+	atomic.AddInt32(&p.workerCount, 1)
+
+	// Increment wait group
+	p.workersWaitGroup.Add(1)
 
 	return true
 }
