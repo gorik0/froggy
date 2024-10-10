@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,46 @@ var (
 // defaultPanicHandler is the default panic handler
 func defaultPanicHandler(panic interface{}) {
 	fmt.Printf("Worker exits from a panic: %v\nStack trace: %s\n", panic, string(debug.Stack()))
+}
+
+// RunningWorkers returns the current number of running workers
+func (p *WorkerPool) RunningWorkers() int {
+	return int(atomic.LoadInt32(&p.workerCount))
+}
+
+// IdleWorkers returns the current number of idle workers
+func (p *WorkerPool) IdleWorkers() int {
+
+	return int(atomic.LoadInt32(&p.idleWorkerCount))
+}
+
+// MinWorkers returns the minimum number of worker goroutines
+func (p *WorkerPool) MinWorkers() int {
+	return p.minWorkers
+}
+
+// MaxWorkers returns the maximum number of worker goroutines
+func (p *WorkerPool) MaxWorkers() int {
+	return p.maxWorkers
+}
+
+// MaxCapacity returns the maximum number of tasks that can be waiting in the queue
+// at any given time (queue size)
+func (p *WorkerPool) MaxCapacity() int {
+	return p.maxCapacity
+}
+
+// Strategy returns the configured pool resizing strategy
+func (p *WorkerPool) Strategy() ResizingStrategy {
+	return p.strategy
+}
+
+func Context(prtCtx context.Context) Option {
+	return func(pool *WorkerPool) {
+		pool.context, pool.contextCancel = context.WithCancel(prtCtx)
+
+	}
+
 }
 
 type Option func(pool *WorkerPool)
@@ -85,5 +126,67 @@ func NewPool(maxWorkers int, maxCapacity int, options ...Option) *WorkerPool {
 	if pool.idleTimeout < 0 {
 		pool.idleTimeout = defaultIdleTimeout
 	}
+
+	// Initialize base context (if not already set)
+	if pool.context == nil {
+		Context(context.Background())(pool)
+	}
+
+	// Create tasks channel
+	pool.tasks = make(chan func(), pool.maxCapacity)
+
+	// Start purger goroutine
+	pool.workersWaitGroup.Add(1)
+	go pool.purge()
+
 	return
+}
+
+func (p *WorkerPool) purge() {
+	defer p.workersWaitGroup.Done()
+
+	idleTicker := time.NewTicker(p.idleTimeout)
+	defer idleTicker.Stop()
+
+	for {
+		select {
+		// Timed out waiting for any activity to happen, attempt to stop an idle worker
+		case <-idleTicker.C:
+			p.maybeStopIdleWorker()
+		// Pool context was cancelled, exit
+		case <-p.context.Done():
+			return
+		}
+	}
+}
+
+// maybeStopIdleWorker attempts to stop an idle worker by sending it a nil task
+func (p *WorkerPool) maybeStopIdleWorker() bool {
+
+	if decremented := p.decrementWorkerCount(); !decremented {
+		return false
+	}
+
+	// Send a nil task to stop an idle worker
+	p.tasks <- nil
+
+	return true
+}
+
+func (p *WorkerPool) decrementWorkerCount() bool {
+
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if p.IdleWorkers() <= 0 || p.RunningWorkers() <= p.minWorkers || p.Stopped() {
+		return false
+	}
+
+	// Decrement worker count
+	atomic.AddInt32(&p.workerCount, -1)
+
+	// Decrement idle count
+	atomic.AddInt32(&p.idleWorkerCount, -1)
+
+	return true
 }
