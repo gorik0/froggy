@@ -62,6 +62,27 @@ func (p *WorkerPool) Strategy() ResizingStrategy {
 	return p.strategy
 }
 
+// SubmittedTasks returns the total number of tasks submitted since the pool was created
+func (p *WorkerPool) SubmittedTasks() uint64 {
+	return atomic.LoadUint64(&p.submittedTaskCount)
+}
+
+// WaitingTasks returns the current number of tasks in the queue that are waiting to be executed
+func (p *WorkerPool) WaitingTasks() uint64 {
+	return atomic.LoadUint64(&p.waitingTaskCount)
+}
+
+// SuccessfulTasks returns the total number of tasks that have successfully completed their exection
+// since the pool was created
+func (p *WorkerPool) SuccessfulTasks() uint64 {
+	return atomic.LoadUint64(&p.successfulTaskCount)
+}
+
+// FailedTasks returns the total number of tasks that completed with panic since the pool was created
+func (p *WorkerPool) FailedTasks() uint64 {
+	return atomic.LoadUint64(&p.failedTaskCount)
+}
+
 func Context(prtCtx context.Context) Option {
 	return func(pool *WorkerPool) {
 		pool.context, pool.contextCancel = context.WithCancel(prtCtx)
